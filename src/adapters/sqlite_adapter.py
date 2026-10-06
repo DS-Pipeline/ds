@@ -117,17 +117,24 @@ def _chunks(values: List[int], size: int) -> List[List[int]]:
     return [values[i:i + size] for i in range(0, len(values), size)] or [[]]
 
 
-def _id_chunks(id_ids: Optional[List[int]]) -> List[Optional[List[int]]]:
-    """None -> no id filter (single pass). Otherwise chunked to stay under
-    SQLite's bound-parameter limit -- the one filter dimension a --where
-    condition (see src/service/selector.py) can realistically make large;
-    lb_ids/cnts come from explicit CLI flags and are assumed to stay small."""
-    if id_ids is None:
+def _value_chunks(values: Optional[List[int]]) -> List[Optional[List[int]]]:
+    """None -> no filter on this column (single pass). Otherwise chunked to
+    stay under SQLite's bound-parameter limit. Used for both id_ids (a
+    --where condition, see src/service/selector.py, can realistically make
+    this large) and cnts (src/cli/commands.py's `compact` can hand back
+    thousands of duplicate transaction numbers -- not bounded by argv like an
+    explicit --cnt flag would be). lb_ids are assumed to stay small (explicit
+    CLI flags only) and are never chunked."""
+    if values is None:
         return [None]
-    uniq = sorted({int(x) for x in id_ids})
+    uniq = sorted({int(x) for x in values})
     if not uniq:
         return [[]]  # explicitly empty (e.g. --where matched nothing) -> matches nothing
     return _chunks(uniq, _SQLITE_MAX_VARS)
+
+
+_id_chunks = _value_chunks
+_cnt_chunks = _value_chunks
 
 
 def _filter_clauses(
@@ -594,27 +601,27 @@ class SQLiteAdapter:
         try:
             table = "transactions_full" if include_archive else "transactions"
             lb_list = sorted({int(x) for x in lb_ids}) if lb_ids is not None else None
-            cnt_list = sorted({int(x) for x in cnts}) if cnts is not None else None
             result: List[Transaction] = []
             for id_chunk in _id_chunks(list(id_ids) if id_ids is not None else None):
-                clauses, params = _filter_clauses(
-                    int(src_id) if src_id is not None else None,
-                    lb_list, id_chunk, cnt_list,
-                    from_dt, until_dt, created_from, created_until,
-                )
-                if from_cnt is not None:
-                    clauses.append("cnt > ?")
-                    params.append(int(from_cnt))
-                where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-                rows = self._conn.execute(
-                    f"SELECT cnt, act, dt, src, lb, id, val, p, created_at FROM {table} {where} ORDER BY cnt",
-                    params,
-                ).fetchall()
-                for row in rows:
-                    mapped = transaction_mapper.record_to_domain(TransactionRecord.from_row(row))
-                    if isinstance(mapped, Err):
-                        return Err(StorageError(mapped.error.message))
-                    result.append(mapped.value)
+                for cnt_chunk in _cnt_chunks(list(cnts) if cnts is not None else None):
+                    clauses, params = _filter_clauses(
+                        int(src_id) if src_id is not None else None,
+                        lb_list, id_chunk, cnt_chunk,
+                        from_dt, until_dt, created_from, created_until,
+                    )
+                    if from_cnt is not None:
+                        clauses.append("cnt > ?")
+                        params.append(int(from_cnt))
+                    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+                    rows = self._conn.execute(
+                        f"SELECT cnt, act, dt, src, lb, id, val, p, created_at FROM {table} {where} ORDER BY cnt",
+                        params,
+                    ).fetchall()
+                    for row in rows:
+                        mapped = transaction_mapper.record_to_domain(TransactionRecord.from_row(row))
+                        if isinstance(mapped, Err):
+                            return Err(StorageError(mapped.error.message))
+                        result.append(mapped.value)
             result.sort(key=lambda t: int(t.cnt))
             return Ok(result)
         except sqlite3.Error as exc:
@@ -634,29 +641,29 @@ class SQLiteAdapter:
         try:
             self._conn.execute("BEGIN")
             lb_list = sorted({int(x) for x in lb_ids}) if lb_ids is not None else None
-            cnt_list = sorted({int(x) for x in cnts}) if cnts is not None else None
             moved = 0
             touched_srcs: set = set()
             for id_chunk in _id_chunks(list(id_ids) if id_ids is not None else None):
-                clauses, params = _filter_clauses(
-                    int(src_id) if src_id is not None else None,
-                    lb_list, id_chunk, cnt_list,
-                    from_dt, until_dt, created_from, created_until,
-                )
-                where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-                touched_srcs.update(
-                    r[0] for r in self._conn.execute(
-                        f"SELECT DISTINCT src FROM transactions {where}", params
-                    ).fetchall()
-                )
-                cur = self._conn.execute(
-                    "INSERT INTO transactions_archive "
-                    "SELECT cnt, act, dt, src, lb, id, val, p, created_at "
-                    f"FROM transactions {where}",
-                    params,
-                )
-                moved += cur.rowcount
-                self._conn.execute(f"DELETE FROM transactions {where}", params)
+                for cnt_chunk in _cnt_chunks(list(cnts) if cnts is not None else None):
+                    clauses, params = _filter_clauses(
+                        int(src_id) if src_id is not None else None,
+                        lb_list, id_chunk, cnt_chunk,
+                        from_dt, until_dt, created_from, created_until,
+                    )
+                    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+                    touched_srcs.update(
+                        r[0] for r in self._conn.execute(
+                            f"SELECT DISTINCT src FROM transactions {where}", params
+                        ).fetchall()
+                    )
+                    cur = self._conn.execute(
+                        "INSERT INTO transactions_archive "
+                        "SELECT cnt, act, dt, src, lb, id, val, p, created_at "
+                        f"FROM transactions {where}",
+                        params,
+                    )
+                    moved += cur.rowcount
+                    self._conn.execute(f"DELETE FROM transactions {where}", params)
             self._bump_struct_versions(touched_srcs)
             self._conn.commit()
             return Ok(moved)
@@ -678,29 +685,29 @@ class SQLiteAdapter:
         try:
             self._conn.execute("BEGIN")
             lb_list = sorted({int(x) for x in lb_ids}) if lb_ids is not None else None
-            cnt_list = sorted({int(x) for x in cnts}) if cnts is not None else None
             moved = 0
             touched_srcs: set = set()
             for id_chunk in _id_chunks(list(id_ids) if id_ids is not None else None):
-                clauses, params = _filter_clauses(
-                    int(src_id) if src_id is not None else None,
-                    lb_list, id_chunk, cnt_list,
-                    from_dt, until_dt, created_from, created_until,
-                )
-                where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-                touched_srcs.update(
-                    r[0] for r in self._conn.execute(
-                        f"SELECT DISTINCT src FROM transactions_archive {where}", params
-                    ).fetchall()
-                )
-                cur = self._conn.execute(
-                    "INSERT INTO transactions "
-                    "SELECT cnt, act, dt, src, lb, id, val, p, created_at "
-                    f"FROM transactions_archive {where}",
-                    params,
-                )
-                moved += cur.rowcount
-                self._conn.execute(f"DELETE FROM transactions_archive {where}", params)
+                for cnt_chunk in _cnt_chunks(list(cnts) if cnts is not None else None):
+                    clauses, params = _filter_clauses(
+                        int(src_id) if src_id is not None else None,
+                        lb_list, id_chunk, cnt_chunk,
+                        from_dt, until_dt, created_from, created_until,
+                    )
+                    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+                    touched_srcs.update(
+                        r[0] for r in self._conn.execute(
+                            f"SELECT DISTINCT src FROM transactions_archive {where}", params
+                        ).fetchall()
+                    )
+                    cur = self._conn.execute(
+                        "INSERT INTO transactions "
+                        "SELECT cnt, act, dt, src, lb, id, val, p, created_at "
+                        f"FROM transactions_archive {where}",
+                        params,
+                    )
+                    moved += cur.rowcount
+                    self._conn.execute(f"DELETE FROM transactions_archive {where}", params)
             self._bump_struct_versions(touched_srcs)
             self._conn.commit()
             return Ok(moved)
@@ -722,27 +729,27 @@ class SQLiteAdapter:
         try:
             self._conn.execute("BEGIN")
             lb_list = sorted({int(x) for x in lb_ids}) if lb_ids is not None else None
-            cnt_list = sorted({int(x) for x in cnts}) if cnts is not None else None
             deleted = 0
             touched_srcs: set = set()
             for id_chunk in _id_chunks(list(id_ids) if id_ids is not None else None):
-                clauses, params = _filter_clauses(
-                    int(src_id) if src_id is not None else None,
-                    lb_list, id_chunk, cnt_list,
-                    from_dt, until_dt, created_from, created_until,
-                )
-                where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-                for table in ("transactions", "transactions_archive"):
-                    touched_srcs.update(
-                        r[0] for r in self._conn.execute(
-                            f"SELECT DISTINCT src FROM {table} {where}", params
-                        ).fetchall()
+                for cnt_chunk in _cnt_chunks(list(cnts) if cnts is not None else None):
+                    clauses, params = _filter_clauses(
+                        int(src_id) if src_id is not None else None,
+                        lb_list, id_chunk, cnt_chunk,
+                        from_dt, until_dt, created_from, created_until,
                     )
-                cur1 = self._conn.execute(f"DELETE FROM transactions {where}", params)
-                cur2 = self._conn.execute(f"DELETE FROM transactions_archive {where}", params)
-                # both tables count toward the total: a hard delete must account for
-                # rows in the archive too, not just the active table
-                deleted += cur1.rowcount + cur2.rowcount
+                    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+                    for table in ("transactions", "transactions_archive"):
+                        touched_srcs.update(
+                            r[0] for r in self._conn.execute(
+                                f"SELECT DISTINCT src FROM {table} {where}", params
+                            ).fetchall()
+                        )
+                    cur1 = self._conn.execute(f"DELETE FROM transactions {where}", params)
+                    cur2 = self._conn.execute(f"DELETE FROM transactions_archive {where}", params)
+                    # both tables count toward the total: a hard delete must account for
+                    # rows in the archive too, not just the active table
+                    deleted += cur1.rowcount + cur2.rowcount
             self._bump_struct_versions(touched_srcs)
             self._conn.commit()
             return Ok(deleted)

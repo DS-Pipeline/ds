@@ -429,6 +429,86 @@ def test_txn_delete_removes_from_both_tables(db):
     assert db.txn_query(include_archive=True).value == []
 
 
+# --- cnts chunking (regression: `ds compact` hands back more cnts than
+# SQLite's bound-parameter limit allows in one query -- see _SQLITE_MAX_VARS.
+# Real builds allow anywhere from ~999 to 250000+ bound params, so these tests
+# shrink _SQLITE_MAX_VARS instead of inserting enough rows to hit the real
+# ceiling -- they lock in the chunking *logic* (every chunk's rows counted
+# once, none missed at the boundary), independent of the host's build.) ---
+
+def _insert_many(db, src, lb, act, n, dt=_TS):
+    """n transactions, each its own id (so none collide as duplicates),
+    returns their cnts."""
+    cnts = []
+    for i in range(n):
+        id_ = db.id_intern(str(i)).value
+        val = db.val_intern(f"v{i}").value
+        cnts.append(_insert(db, src, lb, id_, val, act, dt=dt).value.cnt)
+    return cnts
+
+
+def test_txn_delete_accepts_more_cnts_than_chunk_size(db, monkeypatch):
+    import src.adapters.sqlite_adapter as sqlite_adapter
+    monkeypatch.setattr(sqlite_adapter, "_SQLITE_MAX_VARS", 3)
+    src = _src(db)
+    lb = db.lb_intern("x", src).value
+    act = db.act_intern(Act.POST).value
+    cnts = _insert_many(db, src, lb, act, 10)
+
+    result = db.txn_delete(cnts=cnts)
+    assert isinstance(result, Ok)
+    assert result.value == 10
+    assert db.txn_query(include_archive=True).value == []
+
+
+def test_txn_archive_accepts_more_cnts_than_chunk_size(db, monkeypatch):
+    import src.adapters.sqlite_adapter as sqlite_adapter
+    monkeypatch.setattr(sqlite_adapter, "_SQLITE_MAX_VARS", 3)
+    src = _src(db)
+    lb = db.lb_intern("x", src).value
+    act = db.act_intern(Act.POST).value
+    cnts = _insert_many(db, src, lb, act, 10)
+
+    result = db.txn_archive(cnts=cnts)
+    assert isinstance(result, Ok)
+    assert result.value == 10
+    assert db.txn_query().value == []
+    assert len(db.txn_query(include_archive=True).value) == 10
+
+
+def test_txn_query_accepts_more_cnts_than_chunk_size(db, monkeypatch):
+    import src.adapters.sqlite_adapter as sqlite_adapter
+    monkeypatch.setattr(sqlite_adapter, "_SQLITE_MAX_VARS", 3)
+    src = _src(db)
+    lb = db.lb_intern("x", src).value
+    act = db.act_intern(Act.POST).value
+    cnts = _insert_many(db, src, lb, act, 10)
+
+    result = db.txn_query(cnts=cnts)
+    assert isinstance(result, Ok)
+    assert {int(t.cnt) for t in result.value} == {int(c) for c in cnts}
+
+
+def test_txn_query_tolerates_cnts_past_the_real_sqlite_var_limit(db):
+    """Unlike the chunk-size tests above, this doesn't patch anything --
+    it throws enough params at the real SQLite engine in this process to
+    reproduce the reported `too many SQL variables` failure if cnts were
+    ever passed unchunked again."""
+    import sqlite3
+    limit = sqlite3.connect(":memory:").execute(
+        "PRAGMA compile_options"
+    ).fetchall()
+    max_vars = next(
+        (int(row[0].split("=")[1]) for row in limit if row[0].startswith("MAX_VARIABLE_NUMBER=")),
+        999,
+    )
+    cnts = list(range(1, max_vars + 2))  # one more than the real engine allows unchunked
+
+    result = db.txn_query(cnts=cnts)
+    assert isinstance(result, Ok)
+    assert result.value == []
+
+
 # --- struct_version (ds get --cache invalidation signal) ---
 
 def test_struct_version_starts_at_zero(db):
