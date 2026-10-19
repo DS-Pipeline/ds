@@ -103,4 +103,4 @@ Level 1: для каждой пары `(показатель, id)` побежд�
   `window.DS.sources["CRM"] = {...};` под `file://` — задача потребителя.
 - **Не делает JOIN между источниками.** Каждый документ — один источник.
 - Формат манифеста и `.js`-обёртки специфицирован на стороне потребителя —
-  [`ds-webui/docs/contract.md`](https://github.com/A1eksMa/ds-webui/blob/main/docs/contract.md).
+  [`ds-webui/docs/contract.md`](https://github.com/DS-Pipeline/ds-webui/blob/main/docs/contract.md).
